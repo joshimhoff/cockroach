@@ -112,9 +112,18 @@ var KVStoresTenantWeightsEnabled = settings.RegisterBoolSetting(
 	false,
 )
 
+// Also, remember to adjust kvprober to skip AC queues!
 var SystemTenantBypassesCPUAdmission = settings.RegisterBoolSetting(
 	settings.SystemOnly, "admission.kv.system_tenant_bypass_cpu_admission.enabled",
 	"", true)
+
+var P99Estimator = settings.RegisterBoolSetting(
+	settings.SystemOnly, "admission.kv.p99_estimator.enabled",
+	"", false)
+
+var TenantBypass = settings.RegisterIntSetting(
+	settings.SystemOnly, "admission.kv.tenant_bypass",
+	"", -1)
 
 // EpochLIFOEnabled controls whether the adaptive epoch-LIFO scheme is enabled
 // for admission control. Is only relevant when the above admission control
@@ -604,6 +613,8 @@ type AdmitResponse struct {
 	CPUTokensDeducted int64
 
 	tenantID roachpb.TenantID
+
+	Bypass bool
 }
 
 // Admit is called when requesting admission for some work. If err!=nil, the
@@ -677,6 +688,9 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) AdmitResponse {
 		SystemTenantBypassesCPUAdmission.Get(&q.settings.SV) {
 		info.BypassAdmission = true
 	}
+	if q.isCPUTimeTokenQueue && int64(tenantID) == TenantBypass.Get(&q.settings.SV) {
+		info.BypassAdmission = true
+	}
 	getter := getterKindOne
 	if q.isCPUTimeTokenQueue {
 		getter = tenant.getterKind()
@@ -690,6 +704,7 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) AdmitResponse {
 				tenant.intervalStats.getterOneCount++
 			}
 			tenant.intervalStats.cpuTokens += info.RequestedCount
+			tenant.intervalStats.cpuTokensBypassed += info.RequestedCount
 		}
 		if isInTenantHeap(tenant) {
 			q.mu.tenantHeap.fix(tenant)
@@ -699,6 +714,7 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) AdmitResponse {
 		q.metrics.incAdmitted(info.Priority)
 		q.metrics.recordBypassedAdmission(info.Priority)
 		admitResponse.Enabled = true
+		admitResponse.Bypass = true
 		return admitResponse
 	}
 	// Work is subject to admission control.
@@ -725,6 +741,7 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) AdmitResponse {
 			tenant.intervalStats.getterOneCount++
 		}
 		tenant.intervalStats.cpuTokens += info.RequestedCount
+		tenant.intervalStats.cpuTokensWithWait += info.RequestedCount
 		sll.unlock()
 		// We have unlocked q.mu, so another concurrent request can also do tryGet
 		// and get ahead of this request. We don't need to be fair for such
@@ -804,6 +821,7 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) AdmitResponse {
 			tenant.intervalStats.getterOneCount--
 		}
 		tenant.intervalStats.cpuTokens -= info.RequestedCount
+		tenant.intervalStats.cpuTokensWithWait -= info.RequestedCount
 	}
 
 	// Need to wait.
@@ -992,6 +1010,11 @@ func (q *WorkQueue) AdmittedWorkDone(resp AdmitResponse, cpuTime time.Duration) 
 			if q.isCPUTimeTokenQueue {
 				tenant.adjustTenantCPUTokens(-additionalUsed)
 				tenant.intervalStats.cpuTokens += additionalUsed
+				if resp.Bypass {
+					tenant.intervalStats.cpuTokensBypassed += additionalUsed
+				} else {
+					tenant.intervalStats.cpuTokensWithWait += additionalUsed
+				}
 				if additionalUsed > 0 {
 					tenant.intervalStats.initialCPUTokensUnderestimate += additionalUsed
 				} else if additionalUsed < 0 {
@@ -1054,6 +1077,7 @@ func (q *WorkQueue) granted(grantChainID grantChainID) int64 {
 		tenant.intervalStats.getterOneCount++
 	}
 	tenant.intervalStats.cpuTokens += item.requestedCount
+	tenant.intervalStats.cpuTokensWithWait += item.requestedCount
 	tenant.intervalStats.waitTimeSum += waitDur
 	if isInTenantHeap(tenant) {
 		q.mu.tenantHeap.fix(tenant)
@@ -1350,7 +1374,7 @@ func (q *WorkQueue) setTenantCPUTokensBurstLimit(tokens int64, enabled bool) {
 	defer sll.unlock()
 	q.mu.tenantCPUBurstLimit = tokens
 	q.mu.tenantTokensEnabled = enabled
-	q.mu.cpuTokenEstimator.updateEstimate()
+	q.mu.cpuTokenEstimator.updateEstimate(P99Estimator.Get(&q.settings.SV))
 	logTenantStats := false
 	if now.Sub(q.mu.lastTenantLogTime) > 30*time.Second {
 		q.mu.lastTenantLogTime = now
@@ -1358,11 +1382,15 @@ func (q *WorkQueue) setTenantCPUTokensBurstLimit(tokens int64, enabled bool) {
 	}
 	type tenantLogInfo struct {
 		*tenantInfo
-		lastTokens int64
+		lastTokens   int64
+		lastEstimate int64
+		useP99       bool
 	}
 	var tenants []tenantLogInfo
 	for _, tenant := range q.mu.tenants {
 		lastTokens := tenant.tenantCPUTokens
+		lastEstimate := tenant.cpuTokenEstimator.meanCPUTokens()
+		useP99 := tenant.cpuTokenEstimator.useP99
 		burstDelta := tokens - tenant.tenantCPUBurstLimit
 		prevGetter := tenant.getterKind()
 		tenant.tenantCPUBurstLimit = tokens
@@ -1376,9 +1404,9 @@ func (q *WorkQueue) setTenantCPUTokensBurstLimit(tokens int64, enabled bool) {
 		if prevGetter != curGetter && isInTenantHeap(tenant) {
 			q.mu.tenantHeap.fix(tenant)
 		}
-		tenant.cpuTokenEstimator.updateEstimate()
+		tenant.cpuTokenEstimator.updateEstimate(P99Estimator.Get(&q.settings.SV))
 		if logTenantStats && tenant.intervalStats.admittedCount > 0 {
-			tenants = append(tenants, tenantLogInfo{tenant, lastTokens})
+			tenants = append(tenants, tenantLogInfo{tenant, lastTokens, lastEstimate, useP99})
 		}
 	}
 	slices.SortFunc(tenants, func(a, b tenantLogInfo) int {
@@ -1387,7 +1415,7 @@ func (q *WorkQueue) setTenantCPUTokensBurstLimit(tokens int64, enabled bool) {
 	for _, tenant := range tenants {
 		log.Infof(q.ambientCtx,
 			"KV WorkQueue tenant %d(tb=%s): count=%d(one-frac=%.2f) mean-wait=%s tokens(per-work)=%s(%s) "+
-				"tokens-estimation=(under:%s,over:%s)",
+				"tokens-estimation=(under:%s,over:%s) per-query-tokens-estimation=%s(%v) bypass-vs-not-tokens=%s,%s",
 			tenant.id, time.Duration(tenant.lastTokens),
 			tenant.intervalStats.admittedCount,
 			float64(tenant.intervalStats.getterOneCount)/float64(tenant.intervalStats.admittedCount),
@@ -1395,7 +1423,11 @@ func (q *WorkQueue) setTenantCPUTokensBurstLimit(tokens int64, enabled bool) {
 			time.Duration(tenant.intervalStats.cpuTokens),
 			time.Duration(tenant.intervalStats.cpuTokens/tenant.intervalStats.admittedCount),
 			time.Duration(tenant.intervalStats.initialCPUTokensUnderestimate),
-			time.Duration(tenant.intervalStats.initialCPUTokensOverestimate))
+			time.Duration(tenant.intervalStats.initialCPUTokensOverestimate),
+			time.Duration(tenant.lastEstimate),
+			tenant.useP99,
+			time.Duration(tenant.intervalStats.cpuTokensBypassed),
+			time.Duration(tenant.intervalStats.cpuTokensWithWait))
 		tenant.intervalStats = tenantIntervalStats{}
 	}
 }
@@ -1613,6 +1645,9 @@ type tenantIntervalStats struct {
 	cpuTokens                     int64
 	initialCPUTokensUnderestimate int64
 	initialCPUTokensOverestimate  int64
+
+	cpuTokensBypassed int64
+	cpuTokensWithWait int64
 }
 
 // tenantHeap is a heap of tenants with waiting work, ordered in increasing
@@ -2630,17 +2665,33 @@ const (
 )
 
 type meanCPUTokenEstimator struct {
+	useP99 bool
+
 	buckets    [numBuckets]uint64
 	totalCount uint64
 	P99        int64 // in micros
+
+	// Reset to 0 periodically,
+	intWorkDoneCount     int64
+	intWorkDoneCPUTokens int64
+	// Smoothed estimation. Done in SetTenantCPUTokensBurstLimit.
+	meanWorkCPUTokens int64
 }
 
-func (e *meanCPUTokenEstimator) init(_ int64) {
-	*e = meanCPUTokenEstimator{}
+func (e *meanCPUTokenEstimator) init(mean int64) {
+	*e = meanCPUTokenEstimator{meanWorkCPUTokens: mean}
 }
 
 // Caller periodically, at the same time as SetTenantCPUTokensBurstLimit.
-func (e *meanCPUTokenEstimator) updateEstimate() {
+func (e *meanCPUTokenEstimator) updateEstimate(useP99 bool) {
+	e.useP99 = useP99
+
+	const alpha = 0.5
+	if e.intWorkDoneCount > 0 {
+		intMean := e.intWorkDoneCPUTokens / e.intWorkDoneCount
+		e.meanWorkCPUTokens = int64(alpha*float64(intMean) + (1-alpha)*float64(e.meanWorkCPUTokens))
+	}
+
 	if e.totalCount == 0 {
 		return
 	}
@@ -2659,13 +2710,19 @@ func (e *meanCPUTokenEstimator) updateEstimate() {
 }
 
 func (e *meanCPUTokenEstimator) meanCPUTokens() int64 {
-	if e.P99 == 0 {
-		return time.Millisecond.Nanoseconds()
+	if e.useP99 {
+		if e.P99 == 0 {
+			return time.Millisecond.Nanoseconds()
+		}
+		return e.P99
 	}
-	return e.P99
+	return max(1, e.meanWorkCPUTokens)
 }
 
 func (e *meanCPUTokenEstimator) workDone(cpuTokens int64) {
+	e.intWorkDoneCount++
+	e.intWorkDoneCPUTokens += cpuTokens
+
 	micros := time.Duration(cpuTokens).Microseconds()
 	idx := bucketIdx(micros)
 	e.buckets[idx]++
