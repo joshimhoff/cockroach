@@ -63,6 +63,7 @@ go_library(
 go_test(
     name = "admission_test",
     srcs = [
+        "cpu_time_token_bench_test.go",
         "cpu_time_token_filler_test.go",
         "cpu_time_token_grant_coordinator_test.go",
         "cpu_time_token_granter_test.go",

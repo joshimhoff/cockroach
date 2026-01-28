@@ -113,6 +113,10 @@ type cpuTimeTokenFiller struct {
 	closeCh    chan struct{}
 	// Used only in unit tests.
 	tickCh *chan struct{}
+
+	// State for tick processing.
+	intervalStart      time.Time
+	lastRemainingTicks int64
 }
 
 func (f *cpuTimeTokenFiller) start(ctx context.Context) {
@@ -121,60 +125,22 @@ func (f *cpuTimeTokenFiller) start(ctx context.Context) {
 	f.allocator.resetInterval(ctx)
 
 	ticker := f.timeSource.NewTicker(timePerTick)
-	intervalStart := f.timeSource.Now()
+	f.intervalStart = f.timeSource.Now()
+	// We start with the assumption that a full interval worth of ticks are
+	// remaining. Thus, in the unlikely case where a full 1s passes before
+	// the first tick, the below allocateTokens(1) invariant is still
+	// respected.
+	f.lastRemainingTicks = int64(time.Second / timePerTick)
+
 	// Every 1s a new interval starts. every timePerTick time token allocation
 	// is done. The expected number of ticks left in the interval is passed to
 	// the allocator. The expected number of ticks left can jump around, if
 	// time.Timer ticks are delayed or dropped.
 	go func() {
-		// We start with the assumption that a full interval worth of ticks are
-		// remaining. Thus, in the unlikely case where a full 1s passes before
-		// the first tick, the below allocateTokens(1) invariant is still
-		// respected.
-		lastRemainingTicks := int64(time.Second / timePerTick)
 		for {
 			select {
 			case t := <-ticker.Ch():
-				var remainingTicks int64
-				// Note that time-measuring operations such as t.Sub use monotonic
-				// time. Thus, elapsedSinceIntervalStart should always be >= 0.
-				// https://pkg.go.dev/time#hdr-Monotonic_Clocks
-				elapsedSinceIntervalStart := t.Sub(intervalStart)
-				if elapsedSinceIntervalStart >= time.Second {
-					// INVARIANT: During each interval, allocateTokens(1) must be
-					// called, before resetInterval() can be called. Without this
-					// invariant, cpuTimeTokenAllocator.refillRates tokens would not
-					// be allocated every 1s.
-					//
-					// The below conditional ensures the rate provisioned since the
-					// last tick was fully emitted, which may not be the case if ticks
-					// arrived late. Ideally, this already happened in the else branch
-					// during the previous tick which typically would have occurred at
-					// millisecond 999 and then would compute remainingTicks <= 1 and
-					// would have called allocateTokens(1) (i.e. "emit everything that's
-					// left for this second"). But if the previous tick was not the
-					// designated "last" tick yet (say it occurred at 900ms), and a delay
-					// had occurred before our tick arrived, we need to call
-					// allocateTokens(1) here to release the quota held back by the delay.
-					if lastRemainingTicks > 1 {
-						f.allocator.allocateTokens(1)
-					}
-					intervalStart = t
-					f.allocator.resetInterval(ctx)
-					remainingTicks = int64(time.Second / timePerTick)
-				} else {
-					remainingSinceIntervalStart := time.Second - elapsedSinceIntervalStart
-					if remainingSinceIntervalStart <= 0 {
-						panic(errors.AssertionFailedf("remainingSinceIntervalStart %d is <= 0", remainingSinceIntervalStart))
-					}
-					// ceil(a / b) == (a + b - 1) / b, when using integer division.
-					// Round up so that we don't accumulate tokens to give in a burst on
-					// the last tick.
-					remainingTicks =
-						int64((remainingSinceIntervalStart + timePerTick - 1) / timePerTick)
-				}
-				f.allocator.allocateTokens(max(1, remainingTicks))
-				lastRemainingTicks = remainingTicks
+				f.tick(ctx, t)
 				// Only non-nil in unit tests.
 				if f.tickCh != nil {
 					*f.tickCh <- struct{}{}
@@ -184,6 +150,51 @@ func (f *cpuTimeTokenFiller) start(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// tick processes a single timer tick. It allocates tokens and resets the
+// interval when a new second begins.
+func (f *cpuTimeTokenFiller) tick(ctx context.Context, t time.Time) {
+	var remainingTicks int64
+	// Note that time-measuring operations such as t.Sub use monotonic
+	// time. Thus, elapsedSinceIntervalStart should always be >= 0.
+	// https://pkg.go.dev/time#hdr-Monotonic_Clocks
+	elapsedSinceIntervalStart := t.Sub(f.intervalStart)
+	if elapsedSinceIntervalStart >= time.Second {
+		// INVARIANT: During each interval, allocateTokens(1) must be
+		// called, before resetInterval() can be called. Without this
+		// invariant, cpuTimeTokenAllocator.refillRates tokens would not
+		// be allocated every 1s.
+		//
+		// The below conditional ensures the rate provisioned since the
+		// last tick was fully emitted, which may not be the case if ticks
+		// arrived late. Ideally, this already happened in the else branch
+		// during the previous tick which typically would have occurred at
+		// millisecond 999 and then would compute remainingTicks <= 1 and
+		// would have called allocateTokens(1) (i.e. "emit everything that's
+		// left for this second"). But if the previous tick was not the
+		// designated "last" tick yet (say it occurred at 900ms), and a delay
+		// had occurred before our tick arrived, we need to call
+		// allocateTokens(1) here to release the quota held back by the delay.
+		if f.lastRemainingTicks > 1 {
+			f.allocator.allocateTokens(1)
+		}
+		f.intervalStart = t
+		f.allocator.resetInterval(ctx)
+		remainingTicks = int64(time.Second / timePerTick)
+	} else {
+		remainingSinceIntervalStart := time.Second - elapsedSinceIntervalStart
+		if remainingSinceIntervalStart <= 0 {
+			panic(errors.AssertionFailedf("remainingSinceIntervalStart %d is <= 0", remainingSinceIntervalStart))
+		}
+		// ceil(a / b) == (a + b - 1) / b, when using integer division.
+		// Round up so that we don't accumulate tokens to give in a burst on
+		// the last tick.
+		remainingTicks =
+			int64((remainingSinceIntervalStart + timePerTick - 1) / timePerTick)
+	}
+	f.allocator.allocateTokens(max(1, remainingTicks))
+	f.lastRemainingTicks = remainingTicks
 }
 
 func (f *cpuTimeTokenFiller) close() {
