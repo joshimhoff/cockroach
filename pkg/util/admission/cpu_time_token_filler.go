@@ -13,6 +13,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -204,9 +206,10 @@ var _ cpuTimeTokenAllocatorI = &cpuTimeTokenAllocator{}
 // every interval, while respecting the bucket capacities. The computation
 // of the rate of tokens to add every interval is left to cpuTimeModel.
 type cpuTimeTokenAllocator struct {
-	granter  *cpuTimeTokenGranter
-	settings *cluster.Settings
-	model    cpuTimeModel
+	granter          *cpuTimeTokenGranter
+	settings         *cluster.Settings
+	model            cpuTimeModel
+	multiplierMetric *metric.GaugeFloat64
 
 	// refillRates stores the number of CPU time tokens to add to each bucket
 	// per interval (1s).
@@ -319,6 +322,36 @@ func (a *cpuTimeTokenAllocator) resetInterval(ctx context.Context) {
 	// bucketCapacities.
 	bucketCapacities := capacities(newRefillRates)
 	a.granter.refill(deltaRefillRates, bucketCapacities)
+
+	// Get current bucket token counts for logging.
+	bucketTokens := a.granter.getBucketTokens()
+
+	// Get the multiplier for logging and metrics.
+	multiplier := a.model.getMultiplier()
+
+	// Update multiplier metric if available.
+	if a.multiplierMetric != nil {
+		a.multiplierMetric.Update(multiplier)
+	}
+
+	// Log the CPU time token AC state once per second (every resetInterval call).
+	// Token usage per bucket is available via the Counter metrics
+	// (admission.cpu_time_tokens.tokens_used.tier*.{canBurst,noBurst}).
+	if log.V(1) {
+		log.Dev.Infof(ctx, "cpu_time_token_ac: multiplier=%.3f "+
+			"refill_rates=[tier0_burst=%d tier0_noburst=%d tier1_burst=%d tier1_noburst=%d] "+
+			"delta_refill_rates=[tier0_burst=%d tier0_noburst=%d tier1_burst=%d tier1_noburst=%d] "+
+			"bucket_tokens=[tier0_burst=%d tier0_noburst=%d tier1_burst=%d tier1_noburst=%d]",
+			multiplier,
+			newRefillRates[systemTenant][canBurst], newRefillRates[systemTenant][noBurst],
+			newRefillRates[appTenant][canBurst], newRefillRates[appTenant][noBurst],
+			deltaRefillRates[systemTenant][canBurst], deltaRefillRates[systemTenant][noBurst],
+			deltaRefillRates[appTenant][canBurst], deltaRefillRates[appTenant][noBurst],
+			bucketTokens[systemTenant][canBurst], bucketTokens[systemTenant][noBurst],
+			bucketTokens[appTenant][canBurst], bucketTokens[appTenant][noBurst],
+		)
+	}
+
 	a.refillRates = newRefillRates
 
 	// Reset allocated.
@@ -332,6 +365,7 @@ func (a *cpuTimeTokenAllocator) resetInterval(ctx context.Context) {
 // cpuTimeModel abstracts cpuTimeLinearModel for testing.
 type cpuTimeModel interface {
 	fit(context.Context, targetUtilizations) rates
+	getMultiplier() float64
 }
 
 var _ cpuTimeModel = &cpuTimeTokenLinearModel{}
@@ -603,6 +637,11 @@ func (m *cpuTimeTokenLinearModel) fit(ctx context.Context, targets targetUtiliza
 	return m.computeRefillRates(targets, m.tokenToCPUTimeMultiplier, cpuCapacity)
 }
 
+// getMultiplier returns the current token-to-CPU-time multiplier.
+func (m *cpuTimeTokenLinearModel) getMultiplier() float64 {
+	return m.tokenToCPUTimeMultiplier
+}
+
 // computeRefillRates is a pure helper function that computes refill rates.
 // The CPU capacity is measured in vCPUs. This takes into account the cgroup, so
 // can be fractional.
@@ -616,4 +655,17 @@ func (*cpuTimeTokenLinearModel) computeRefillRates(
 		}
 	}
 	return refillRates
+}
+
+var cpuTimeTokenMultiplier = metric.Metadata{
+	Name:        "admission.cpu_time_tokens.multiplier",
+	Help:        "The token-to-CPU-time multiplier used in CPU time token admission control",
+	Measurement: "Multiplier",
+	Unit:        metric.Unit_COUNT,
+}
+
+func makeCPUTimeTokenMultiplierMetric(registry *metric.Registry) *metric.GaugeFloat64 {
+	m := metric.NewGaugeFloat64(cpuTimeTokenMultiplier)
+	registry.AddMetric(m)
+	return m
 }

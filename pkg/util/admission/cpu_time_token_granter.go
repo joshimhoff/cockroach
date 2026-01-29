@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/olekukonko/tablewriter"
 )
@@ -119,7 +120,9 @@ func (cg *cpuTimeTokenChildGranter) continueGrantChain(grantChainID grantChainID
 // TODO(josh): Turn into a proper design documnet.
 type cpuTimeTokenGranter struct {
 	requester [numResourceTiers]requester
-	mu        struct {
+	// Metrics for observability. May be nil if metrics are not set up.
+	metrics *cpuTimeTokenGranterMetrics
+	mu      struct {
 		// TODO(josh): I suspect putting the mutex here is better than in
 		// CPUTimeTokenGrantCoordinator, but for now the decision is tentative.
 		// Think better to decice when I put up a PR that introduces
@@ -136,6 +139,14 @@ type cpuTimeTokenGranter struct {
 		buckets    [numResourceTiers][numBurstQualifications]tokenBucket
 		tokensUsed int64
 	}
+}
+
+// cpuTimeTokenGranterMetrics contains metrics for the cpuTimeTokenGranter.
+type cpuTimeTokenGranterMetrics struct {
+	// Token counts per bucket (gauges updated in refill).
+	bucketTokens [numResourceTiers][numBurstQualifications]*metric.Gauge
+	// Token usage per bucket (counters incremented on token consumption).
+	tokensUsed [numResourceTiers][numBurstQualifications]*metric.Counter
 }
 
 // TODO(josh): Make this observable. See here for one approach:
@@ -211,6 +222,14 @@ func (stg *cpuTimeTokenGranter) tookWithoutPermissionLocked(count int64) {
 	for tier := range stg.mu.buckets {
 		for qual := range stg.mu.buckets[tier] {
 			stg.mu.buckets[tier][qual].tokens -= count
+		}
+	}
+	// Update token usage counters. Only increment for positive counts (actual usage).
+	if stg.metrics != nil && count > 0 {
+		for tier := range stg.metrics.tokensUsed {
+			for qual := range stg.metrics.tokensUsed[tier] {
+				stg.metrics.tokensUsed[tier][qual].Inc(count)
+			}
 		}
 	}
 }
@@ -293,6 +312,10 @@ func (stg *cpuTimeTokenGranter) refill(toAdd tokenCounts, bucketCapacities capac
 				newTokenCount = bucketCapacities[wc][kind]
 			}
 			stg.mu.buckets[wc][kind].tokens = newTokenCount
+			// Update bucket token gauges.
+			if stg.metrics != nil {
+				stg.metrics.bucketTokens[wc][kind].Update(newTokenCount)
+			}
 		}
 	}
 
@@ -300,4 +323,52 @@ func (stg *cpuTimeTokenGranter) refill(toAdd tokenCounts, bucketCapacities capac
 	if shouldGrant {
 		stg.grantUntilNoWaitingRequestsLocked()
 	}
+}
+
+// getBucketTokens returns the current token counts in all buckets.
+func (stg *cpuTimeTokenGranter) getBucketTokens() tokenCounts {
+	stg.mu.Lock()
+	defer stg.mu.Unlock()
+	var counts tokenCounts
+	for tier := range stg.mu.buckets {
+		for qual := range stg.mu.buckets[tier] {
+			counts[tier][qual] = stg.mu.buckets[tier][qual].tokens
+		}
+	}
+	return counts
+}
+
+var (
+	cpuTimeTokenBucketTokens = metric.Metadata{
+		Name:        "admission.cpu_time_tokens.bucket_tokens",
+		Help:        "Token count in each bucket",
+		Measurement: "Tokens",
+		Unit:        metric.Unit_COUNT,
+	}
+	cpuTimeTokensUsed = metric.Metadata{
+		Name:        "admission.cpu_time_tokens.tokens_used",
+		Help:        "Cumulative tokens used from each bucket",
+		Measurement: "Tokens",
+		Unit:        metric.Unit_COUNT,
+	}
+)
+
+func makeCPUTimeTokenGranterMetrics(registry *metric.Registry) *cpuTimeTokenGranterMetrics {
+	m := &cpuTimeTokenGranterMetrics{}
+	for tier := resourceTier(0); tier < numResourceTiers; tier++ {
+		for qual := burstQualification(0); qual < numBurstQualifications; qual++ {
+			bucketMeta := cpuTimeTokenBucketTokens
+			bucketMeta.Name = fmt.Sprintf(
+				"admission.cpu_time_tokens.bucket_tokens.tier%d.%s", tier, qual.String())
+			m.bucketTokens[tier][qual] = metric.NewGauge(bucketMeta)
+			registry.AddMetric(m.bucketTokens[tier][qual])
+
+			usedMeta := cpuTimeTokensUsed
+			usedMeta.Name = fmt.Sprintf(
+				"admission.cpu_time_tokens.tokens_used.tier%d.%s", tier, qual.String())
+			m.tokensUsed[tier][qual] = metric.NewCounter(usedMeta)
+			registry.AddMetric(m.tokensUsed[tier][qual])
+		}
+	}
+	return m
 }

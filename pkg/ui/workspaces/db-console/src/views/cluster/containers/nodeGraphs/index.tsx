@@ -73,6 +73,7 @@ import { MetricsDataProvider } from "src/views/shared/containers/metricDataProvi
 import TimeScaleDropdown from "../timeScaleDropdownWithSearchParams";
 
 import changefeedsDashboard from "./dashboards/changefeeds";
+import cpuTokenACDashboard from "./dashboards/cpuTokenAC";
 import crossClusterReplicationDashboard from "./dashboards/crossClusterReplication";
 import {
   GraphDashboardProps,
@@ -150,6 +151,11 @@ const dashboards: { [key: string]: GraphDashboard } = {
   overload: {
     label: "Overload",
     component: overloadDashboard,
+    isKvDashboard: true,
+  },
+  cpuTokenAC: {
+    label: "CPU Token AC",
+    component: cpuTokenACDashboard,
     isKvDashboard: true,
   },
   ttl: { label: "TTL", component: ttlDashboard, isKvDashboard: false },

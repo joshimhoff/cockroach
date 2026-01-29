@@ -8,13 +8,13 @@ package admission
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/goschedstats"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -97,7 +97,13 @@ func makeCPUTimeTokenGrantCoordinator(
 	registry *metric.Registry,
 	knobs *TestingKnobs,
 ) *cpuTimeTokenGrantCoordinator {
-	granter := &cpuTimeTokenGranter{}
+	// Create metrics for CPU time token AC.
+	granterMetrics := makeCPUTimeTokenGranterMetrics(registry)
+	multiplierMetric := makeCPUTimeTokenMultiplierMetric(registry)
+
+	granter := &cpuTimeTokenGranter{
+		metrics: granterMetrics,
+	}
 	var childGranters [numResourceTiers]cpuTimeTokenChildGranter
 	for tier := resourceTier(0); tier < numResourceTiers; tier++ {
 		childGranters[tier] = cpuTimeTokenChildGranter{
@@ -111,8 +117,9 @@ func makeCPUTimeTokenGrantCoordinator(
 		closeCh:    make(chan struct{}),
 	}
 	allocator := &cpuTimeTokenAllocator{
-		granter:  granter,
-		settings: settings,
+		granter:          granter,
+		settings:         settings,
+		multiplierMetric: multiplierMetric,
 	}
 	model := &cpuTimeTokenLinearModel{
 		granter:            granter,
@@ -145,18 +152,17 @@ func makeCPUTimeTokenGrantCoordinator(
 	// issue, we have the following ticket:
 	// https://github.com/cockroachdb/cockroach/issues/161945
 	if !knobs.DisableCPUTimeTokenFillerGoroutine {
-		var fillerStarted bool
+		var once sync.Once
 		if cpuTimeTokenACEnabled.Get(&settings.SV) {
-			filler.start(ambientCtx.AnnotateCtx(context.Background()))
-			fillerStarted = true
-		}
-		var mu syncutil.Mutex
-		cpuTimeTokenACEnabled.SetOnChange(&settings.SV, func(ctx context.Context) {
-			mu.Lock()
-			defer mu.Unlock()
-			if !fillerStarted && cpuTimeTokenACEnabled.Get(&settings.SV) {
+			once.Do(func() {
 				filler.start(ambientCtx.AnnotateCtx(context.Background()))
-				fillerStarted = true
+			})
+		}
+		cpuTimeTokenACEnabled.SetOnChange(&settings.SV, func(ctx context.Context) {
+			if cpuTimeTokenACEnabled.Get(&settings.SV) {
+				once.Do(func() {
+					filler.start(ambientCtx.AnnotateCtx(context.Background()))
+				})
 			}
 		})
 	}

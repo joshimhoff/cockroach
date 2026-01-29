@@ -90,11 +90,16 @@ func (a *testTokenAllocator) allocateTokens(remainingTicks int64) {
 }
 
 type testModel struct {
-	buf   *strings.Builder
-	rates rates
+	buf        *strings.Builder
+	rates      rates
+	multiplier float64
 }
 
 func (m *testModel) init() {}
+
+func (m *testModel) getMultiplier() float64 {
+	return m.multiplier
+}
 
 func (m *testModel) fit(_ context.Context, targets targetUtilizations) rates {
 	// targets uses float64, which when written to golden file can lead to
