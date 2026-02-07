@@ -105,7 +105,10 @@ func makeCPUTimeTokenGrantCoordinator(
 			parent: granter,
 		}
 	}
-	timeSource := timeutil.DefaultTimeSource{}
+	var timeSource timeutil.TimeSource = timeutil.DefaultTimeSource{}
+	if knobs.TimeSource != nil {
+		timeSource = knobs.TimeSource
+	}
 	filler := &cpuTimeTokenFiller{
 		timeSource: timeSource,
 		closeCh:    make(chan struct{}),
@@ -127,6 +130,9 @@ func makeCPUTimeTokenGrantCoordinator(
 	for tier := resourceTier(0); tier < numResourceTiers; tier++ {
 		opts := makeWorkQueueOptions(KVWork)
 		opts.mode = usesCPUTimeTokens
+		if knobs.TimeSource != nil {
+			opts.timeSource = knobs.TimeSource
+		}
 		requesters[tier] = makeWorkQueue(
 			ambientCtx, KVWork, &childGranters[tier], settings, wqMetrics, opts)
 		granter.requester[tier] = requesters[tier]

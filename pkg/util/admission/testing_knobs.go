@@ -9,6 +9,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 // TestingKnobs provide fine-grained control over the various admission control
@@ -50,6 +51,10 @@ type TestingKnobs struct {
 	// DisableCPUTimeTokenSQLBypass disables the functionality which
 	// has SQL work bypass AC, in case CPU time token AC is enabled.
 	DisableCPUTimeTokenSQLBypass bool
+
+	// TimeSource, if non-nil, overrides the default time source used by
+	// CPU time token AC components (filler, model, and work queues).
+	TimeSource timeutil.TimeSource
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
