@@ -707,6 +707,7 @@ func (r *testRunner) allocateOrAttachToCluster(
 		localCluster: clustersOpt.typ == localCluster,
 		arch:         arch,
 		os:           clusterOS,
+		testName:     t.Name,
 	}
 	return clusterFactory.newCluster(ctx, cfg, wStatus.SetStatus, lopt.tee)
 }

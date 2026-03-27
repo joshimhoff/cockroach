@@ -789,6 +789,10 @@ type clusterConfig struct {
 	arch vm.CPUArch
 	// Specifies the OS which may require a custom AMI and cockroach binary.
 	os string
+	// testName is the name of the test that will use this cluster. It is
+	// included (abbreviated) in the cluster name for easier identification
+	// in roachprod and Grafana.
+	testName string
 }
 
 // clusterFactory is a creator of clusters.
@@ -844,8 +848,47 @@ func (f *clusterFactory) genName(cfg clusterConfig) string {
 		return cfg.nameOverride
 	}
 	count := f.counter.Add(1)
-	return makeClusterName(
-		fmt.Sprintf("%s-%02d-%s", f.namePrefix, count, cfg.spec.String()))
+	specStr := cfg.spec.String()
+
+	// Include an abbreviated test name in the cluster name for easier
+	// identification in roachprod and Grafana. Use the last path segment
+	// of the test name (e.g., "noisy-neighbor" from
+	// "admission-control/multitenant-fairness/read-heavy/noisy-neighbor").
+	testLabel := ""
+	if cfg.testName != "" {
+		parts := strings.Split(cfg.testName, "/")
+		// Use up to the last two path segments for uniqueness.
+		if len(parts) > 2 {
+			parts = parts[len(parts)-2:]
+		}
+		testLabel = strings.Join(parts, "-")
+		testLabel = makeClusterName(testLabel)
+	}
+
+	var name string
+	if testLabel != "" {
+		name = fmt.Sprintf("%s-%02d-%s-%s", f.namePrefix, count, testLabel, specStr)
+		// GCE instance names must be <= 63 characters.
+		if len(name) > 63 {
+			// Truncate the test label to fit, keeping prefix, counter, and spec.
+			overhead := len(fmt.Sprintf("%s-%02d--%s", f.namePrefix, count, specStr))
+			maxLabel := 63 - overhead
+			if maxLabel > 0 {
+				testLabel = testLabel[:min(len(testLabel), maxLabel)]
+				testLabel = strings.TrimRight(testLabel, "-")
+			} else {
+				testLabel = ""
+			}
+			if testLabel != "" {
+				name = fmt.Sprintf("%s-%02d-%s-%s", f.namePrefix, count, testLabel, specStr)
+			} else {
+				name = fmt.Sprintf("%s-%02d-%s", f.namePrefix, count, specStr)
+			}
+		}
+	} else {
+		name = fmt.Sprintf("%s-%02d-%s", f.namePrefix, count, specStr)
+	}
+	return makeClusterName(name)
 }
 
 // createFlagsOverride updates opts with the override values passed from the cli.

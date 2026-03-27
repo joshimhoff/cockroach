@@ -40,10 +40,11 @@ LIMIT
     100;`
 
 type tpccOLAPSpec struct {
-	Nodes       int
-	CPUs        int
-	Warehouses  int
-	Concurrency int
+	Nodes          int
+	CPUs           int
+	Warehouses     int
+	Concurrency    int
+	CPUTimeTokenAC bool
 }
 
 func (s tpccOLAPSpec) run(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -51,6 +52,22 @@ func (s tpccOLAPSpec) run(ctx context.Context, t test.Test, c cluster.Cluster) {
 		ctx, t, t.L(), c, tpccOptions{
 			Warehouses: s.Warehouses, SetupType: usingImport,
 		})
+
+	if s.CPUTimeTokenAC {
+		db := c.Conn(ctx, t.L(), 1)
+		defer db.Close()
+		if _, err := db.ExecContext(
+			ctx, `SET CLUSTER SETTING admission.cpu_time_tokens.enabled = true`,
+		); err != nil {
+			t.Fatalf("failed to enable cpu time tokens: %v", err)
+		}
+		if _, err := db.ExecContext(
+			ctx, `SET CLUSTER SETTING admission.cpu_time_tokens.target_util.system_tenant = '0.8'`,
+		); err != nil {
+			t.Fatalf("failed to set cpu time token target util: %v", err)
+		}
+	}
+
 	const queryFileName = "queries.sql"
 	// querybench expects the entire query to be on a single line.
 	queryLine := `"` + strings.Replace(tpccOlapQuery, "\n", " ", -1) + `"`
@@ -60,6 +77,7 @@ func (s tpccOLAPSpec) run(ctx context.Context, t test.Test, c cluster.Cluster) {
 	rampDuration := 2 * time.Minute
 	duration := 3 * time.Minute
 	labels := getTpccLabels(s.Warehouses, rampDuration, duration, map[string]string{"concurrency": strconv.Itoa(s.Concurrency)})
+	workloadStart := timeutil.Now()
 	m.Go(func(ctx context.Context) error {
 		t.WorkerStatus("running querybench")
 		cmd := fmt.Sprintf(
@@ -75,6 +93,14 @@ func (s tpccOLAPSpec) run(ctx context.Context, t test.Test, c cluster.Cluster) {
 		return nil
 	})
 	m.Wait()
+	workloadEnd := timeutil.Now()
+
+	if s.CPUTimeTokenAC {
+		verifyCPUUtilization(
+			ctx, c, t, c.Node(1), workloadStart, workloadEnd,
+			0.8 /* targetCPU */, 0.15 /* tolerance */, nil, /* sources */
+		)
+	}
 
 	// Before checking liveness, set the gRPC logging[^1] to verbose. We stopped the
 	// load so this should be OK in terms of overhead, and it can explain to us why
@@ -153,10 +179,20 @@ func registerTPCCOverload(r registry.Registry) {
 			Nodes:       3,
 			Warehouses:  50,
 		},
+		{
+			CPUs:           8,
+			Concurrency:    96,
+			Nodes:          3,
+			Warehouses:     50,
+			CPUTimeTokenAC: true,
+		},
 	}
 	for _, s := range specs {
 		name := fmt.Sprintf("admission-control/tpcc-olap/nodes=%d/cpu=%d/w=%d/c=%d",
 			s.Nodes, s.CPUs, s.Warehouses, s.Concurrency)
+		if s.CPUTimeTokenAC {
+			name += "/cpu-time-tokens"
+		}
 		r.Add(registry.TestSpec{
 			Name:                       name,
 			Owner:                      registry.OwnerAdmissionControl,

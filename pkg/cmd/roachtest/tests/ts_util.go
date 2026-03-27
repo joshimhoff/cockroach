@@ -7,6 +7,7 @@ package tests
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -229,5 +230,58 @@ func verifyLookupsPerSec(
 		} else {
 			t.L().Printf("Found minute interval with %f lookup/sec\n", dp.Value)
 		}
+	}
+}
+
+// verifyCPUUtilization queries the combined CPU utilization metric over the
+// given time window and asserts that the average is within tolerance of the
+// target. sources, if non-nil, restricts the query to specific node sources.
+func verifyCPUUtilization(
+	ctx context.Context,
+	c cluster.Cluster,
+	t test.Test,
+	adminNode option.NodeListOption,
+	start, end time.Time,
+	targetCPU, tolerance float64,
+	sources []string,
+) {
+	adminUIAddrs, err := c.ExternalAdminUIAddr(ctx, t.L(), adminNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminURL := adminUIAddrs[0]
+	response := mustGetMetrics(
+		ctx, c, t, adminURL, install.SystemInterfaceName, start, end, []tsQuery{
+			{
+				name:      "cr.node.sys.cpu.combined.percent-normalized",
+				queryType: total,
+				sources:   sources,
+			},
+		})
+
+	// Drop the first two data points as a ramp-up period.
+	datapoints := response.Results[0].Datapoints
+	if len(datapoints) > 2 {
+		datapoints = datapoints[2:]
+	}
+	if len(datapoints) == 0 {
+		t.Fatal("not enough CPU utilization datapoints")
+	}
+
+	var sum float64
+	for _, dp := range datapoints {
+		sum += dp.Value
+	}
+	avgCPU := sum / float64(len(datapoints))
+
+	t.L().Printf(
+		"average CPU utilization: %.2f%%, target: %.2f%%, tolerance: %.2f%%",
+		avgCPU*100, targetCPU*100, tolerance*100,
+	)
+	if math.Abs(avgCPU-targetCPU) > tolerance {
+		t.Fatalf(
+			"average CPU utilization %.2f%% not within %.2f%% of target %.2f%%",
+			avgCPU*100, tolerance*100, targetCPU*100,
+		)
 	}
 }
